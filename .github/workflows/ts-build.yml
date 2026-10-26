@@ -1,9 +1,16 @@
 name: TS Build
 
-# 只为 feat/tailscale-latest 分支编译 Linux 二进制（amd64 + arm64），
-# 用于验证「最新 Alpha + Tailscale 特性」能否正常编译，并直接下载产物。
+# 「最新 Alpha + Tailscale 特性」多平台编译
+# 覆盖：Linux(386/amd64 v1-v3/arm64/armv5-7/mips/mipsle/mips64/mips64le/loong64/riscv64/s390x/ppc64le)
+#       macOS(amd64/arm64) / Windows(386/amd64/arm64) / FreeBSD(amd64/arm64) / Android(arm64/armv7)
+# 统一使用与官方一致的 -tags "with_gvisor"（Tailscale 代码在 //go:build with_gvisor && !no_tailscale 下）
 on:
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "构建完成后创建 GitHub Release（方便直接下载）"
+        type: boolean
+        default: true
   push:
     branches:
       - feat/tailscale-latest
@@ -11,15 +18,53 @@ on:
       - "docs/**"
       - "README.md"
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      max-parallel: 20
       matrix:
         include:
-          - { output: amd64, goarch: amd64, goamd64: v1 }
-          - { output: arm64, goarch: arm64 }
+          # ---------- Linux ----------
+          - { goos: linux, goarch: "386", go386: sse2, output: "386" }
+          - { goos: linux, goarch: "386", go386: softfloat, output: "386-softfloat" }
+          - { goos: linux, goarch: amd64, goamd64: v1, output: amd64-compatible }
+          - { goos: linux, goarch: amd64, goamd64: v2, output: amd64-v2 }
+          - { goos: linux, goarch: amd64, goamd64: v3, output: amd64 }
+          - { goos: linux, goarch: arm64, output: arm64 }
+          - { goos: linux, goarch: arm, goarm: "5", output: armv5 }
+          - { goos: linux, goarch: arm, goarm: "6", output: armv6 }
+          - { goos: linux, goarch: arm, goarm: "7", output: armv7 }
+          - { goos: linux, goarch: mips, gomips: hardfloat, output: mips-hardfloat }
+          - { goos: linux, goarch: mips, gomips: softfloat, output: mips-softfloat }
+          - { goos: linux, goarch: mipsle, gomips: hardfloat, output: mipsle-hardfloat }
+          - { goos: linux, goarch: mipsle, gomips: softfloat, output: mipsle-softfloat }
+          - { goos: linux, goarch: mips64, output: mips64 }
+          - { goos: linux, goarch: mips64le, output: mips64le }
+          - { goos: linux, goarch: loong64, output: loong64 }
+          - { goos: linux, goarch: riscv64, output: riscv64 }
+          - { goos: linux, goarch: s390x, output: s390x }
+          - { goos: linux, goarch: ppc64le, output: ppc64le }
+          # ---------- macOS ----------
+          - { goos: darwin, goarch: amd64, goamd64: v1, output: amd64 }
+          - { goos: darwin, goarch: amd64, goamd64: v3, output: amd64-v3 }
+          - { goos: darwin, goarch: arm64, output: arm64 }
+          # ---------- Windows ----------
+          - { goos: windows, goarch: "386", output: "386" }
+          - { goos: windows, goarch: amd64, goamd64: v1, output: amd64 }
+          - { goos: windows, goarch: amd64, goamd64: v2, output: amd64-v2 }
+          - { goos: windows, goarch: amd64, goamd64: v3, output: amd64-v3 }
+          - { goos: windows, goarch: arm64, output: arm64 }
+          # ---------- FreeBSD ----------
+          - { goos: freebsd, goarch: amd64, goamd64: v1, output: amd64 }
+          - { goos: freebsd, goarch: arm64, output: arm64 }
+          # ---------- Android（需要 NDK + CGO，失败不阻塞其他目标）----------
+          - { goos: android, goarch: arm64, ndk: aarch64-linux-android34, output: arm64-v8, cgo: true }
+          - { goos: android, goarch: arm, ndk: armv7a-linux-androideabi34, output: armv7, cgo: true }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -30,38 +75,131 @@ jobs:
         with:
           go-version: "1.26.0"
           check-latest: false
+          cache: true
 
-      - name: Verify Go
-        run: go version && go env
+      - name: Setup NDK
+        if: ${{ matrix.cgo }}
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r27c
 
       - name: Set variables
         run: |
-          VERSION="alpha-ts-$(git rev-parse --short HEAD)"
-          echo "VERSION=${VERSION}" >> $GITHUB_ENV
-          echo "BUILDTIME=$(date)" >> $GITHUB_ENV
-          echo "CGO_ENABLED=0" >> $GITHUB_ENV
+          echo "VERSION=alpha-ts-$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          echo "BUILDTIME=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_ENV
           echo "GOTOOLCHAIN=local" >> $GITHUB_ENV
+          if [ "${{ matrix.cgo }}" = "true" ]; then
+            echo "CGO_ENABLED=1" >> $GITHUB_ENV
+            echo "CC=${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.ndk }}-clang" >> $GITHUB_ENV
+            echo "EXT_LDFLAGS=" >> $GITHUB_ENV
+          else
+            echo "CGO_ENABLED=0" >> $GITHUB_ENV
+            echo "EXT_LDFLAGS=-extldflags --static" >> $GITHUB_ENV
+          fi
+
+      - name: Verify Go
+        run: go version && go env GOOS GOARCH CGO_ENABLED
 
       - name: Update CA
+        # 交叉编译（非 android）时把系统根证书打进二进制，避免目标机无 CA
+        if: ${{ !matrix.cgo }}
         run: |
-          sudo apt-get update && sudo apt-get install -y ca-certificates
+          sudo apt-get update -qq && sudo apt-get install -y -qq ca-certificates
           sudo update-ca-certificates
           cp -f /etc/ssl/certs/ca-certificates.crt component/ca/ca-certificates.crt
 
       - name: Build core
         env:
-          GOOS: linux
+          GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           GOAMD64: ${{ matrix.goamd64 }}
+          GO386: ${{ matrix.go386 }}
+          GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
         run: |
           go build -v -tags "with_gvisor" -trimpath \
-            -ldflags "-extldflags --static -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid="
-          cp mihomo mihomo-linux-${{ matrix.output }}-${VERSION}
-          ls -lh mihomo-linux-${{ matrix.output }}-${VERSION}
+            -ldflags "${EXT_LDFLAGS} \
+              -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' \
+              -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' \
+              -w -s -buildid="
+          NAME="mihomo-${{ matrix.goos }}-${{ matrix.output }}-${VERSION}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            mv mihomo.exe "${NAME}.exe"
+            zip -q "${NAME}.zip" "${NAME}.exe"
+            ls -lh "${NAME}.zip"
+          else
+            mv mihomo "${NAME}"
+            tar -czf "${NAME}.tar.gz" "${NAME}"
+            ls -lh "${NAME}.tar.gz"
+          fi
 
       - name: Upload artifact
+        continue-on-error: ${{ matrix.cgo == true }}
         uses: actions/upload-artifact@v4
         with:
-          name: mihomo-linux-${{ matrix.output }}
-          path: mihomo-linux-${{ matrix.output }}-*
+          name: mihomo-${{ matrix.goos }}-${{ matrix.output }}
+          path: |
+            mihomo-${{ matrix.goos }}-${{ matrix.output }}-*.tar.gz
+            mihomo-${{ matrix.goos }}-${{ matrix.output }}-*.zip
           if-no-files-found: error
+          retention-days: 14
+
+  collect:
+    needs: build
+    if: always() && needs.build.result != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: mihomo-*
+          path: dist
+          merge-multiple: true
+
+      - name: Show summary
+        run: |
+          echo "### 构建产物" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 文件 | 大小 |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          for f in dist/*; do
+            echo "| $(basename "$f") | $(du -h "$f" | cut -f1) |" >> $GITHUB_STEP_SUMMARY
+          done
+          ls -lh dist
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: mihomo-ts-all
+          path: dist/*
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Publish release
+        if: github.event_name == 'workflow_dispatch' && inputs.publish_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHORT="${GITHUB_SHA::7}"
+          TAG="ts-build-${GITHUB_RUN_NUMBER}"
+          cat > notes.md <<'EOF'
+          基于 MetaCubeX/mihomo 最新 Alpha，合入 Tailscale 特性：
+          - advertise subnet routes（宣告子网路由）
+          - TUN ICMP echo 走 Tailscale
+          - 固定 Tailscale UDP 监听端口
+          - opt-in host forwarding
+
+          构建参数：-tags "with_gvisor"，CGO 关闭，静态链接，内置 CA 根证书。
+          EOF
+          echo "" >> notes.md
+          echo "版本号：alpha-ts-${SHORT}" >> notes.md
+          echo "对应 commit：${GITHUB_SHA}" >> notes.md
+          echo "" >> notes.md
+          echo "平台：Linux / macOS / Windows / FreeBSD / Android，产物见下方 Assets。" >> notes.md
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "mihomo alpha-ts-${SHORT} (multi-platform)" \
+            --notes-file notes.md \
+            --prerelease
