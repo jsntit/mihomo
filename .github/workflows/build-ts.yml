@@ -1,0 +1,239 @@
+name: Build (ts)
+
+# 手动触发：Actions → Build (ts) → Run workflow
+# 也可推一个 v*-ts 的 tag 自动出包
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号 / Release tag（如 v1.19.34-ts）"
+        required: true
+        default: "v1.19.34-ts"
+      targets:
+        description: "编译目标：all(不含 android) / core(常用 10 个) / linux / desktop / freebsd / android，也可逗号分隔，如 linux,darwin"
+        required: false
+        default: "all"
+      create_release:
+        description: "构建完成后创建/更新 Release（否则只留 Artifact）"
+        type: boolean
+        default: true
+  push:
+    tags:
+      - "v*-ts"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-ts-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 编译目标清单。tags 用于筛选，output 决定产物文件名后缀。
+  # 注意：amd64 用 v3(amd64) + v1(amd64-compatible) 两种，与上游命名保持一致。
+  MATRIX_JSON: |
+    [
+      {"tags":["core","linux"],"goos":"linux","goarch":"386","output":"386"},
+      {"tags":["linux"],"goos":"linux","goarch":"386","go386":"softfloat","output":"386-softfloat"},
+      {"tags":["core","linux"],"goos":"linux","goarch":"amd64","goamd64":"v1","output":"amd64-compatible"},
+      {"tags":["linux"],"goos":"linux","goarch":"amd64","goamd64":"v2","output":"amd64-v2"},
+      {"tags":["core","linux"],"goos":"linux","goarch":"amd64","goamd64":"v3","output":"amd64"},
+      {"tags":["core","linux"],"goos":"linux","goarch":"arm64","output":"arm64"},
+      {"tags":["linux"],"goos":"linux","goarch":"arm","goarm":"5","output":"armv5"},
+      {"tags":["linux"],"goos":"linux","goarch":"arm","goarm":"6","output":"armv6"},
+      {"tags":["core","linux"],"goos":"linux","goarch":"arm","goarm":"7","output":"armv7"},
+      {"tags":["linux"],"goos":"linux","goarch":"mips","gomips":"hardfloat","output":"mips-hardfloat"},
+      {"tags":["linux"],"goos":"linux","goarch":"mips","gomips":"softfloat","output":"mips-softfloat"},
+      {"tags":["linux"],"goos":"linux","goarch":"mipsle","gomips":"hardfloat","output":"mipsle-hardfloat"},
+      {"tags":["core","linux"],"goos":"linux","goarch":"mipsle","gomips":"softfloat","output":"mipsle-softfloat"},
+      {"tags":["linux"],"goos":"linux","goarch":"mips64","output":"mips64"},
+      {"tags":["linux"],"goos":"linux","goarch":"mips64le","output":"mips64le"},
+      {"tags":["linux"],"goos":"linux","goarch":"riscv64","output":"riscv64"},
+      {"tags":["linux"],"goos":"linux","goarch":"loong64","output":"loong64"},
+      {"tags":["linux"],"goos":"linux","goarch":"s390x","output":"s390x"},
+      {"tags":["linux"],"goos":"linux","goarch":"ppc64le","output":"ppc64le"},
+
+      {"tags":["core","desktop","darwin"],"goos":"darwin","goarch":"amd64","goamd64":"v1","output":"amd64-compatible"},
+      {"tags":["desktop","darwin"],"goos":"darwin","goarch":"amd64","goamd64":"v2","output":"amd64-v2"},
+      {"tags":["desktop","darwin"],"goos":"darwin","goarch":"amd64","goamd64":"v3","output":"amd64"},
+      {"tags":["core","desktop","darwin"],"goos":"darwin","goarch":"arm64","output":"arm64"},
+
+      {"tags":["desktop","windows"],"goos":"windows","goarch":"386","output":"386"},
+      {"tags":["desktop","windows"],"goos":"windows","goarch":"amd64","goamd64":"v1","output":"amd64-compatible"},
+      {"tags":["desktop","windows"],"goos":"windows","goarch":"amd64","goamd64":"v2","output":"amd64-v2"},
+      {"tags":["core","desktop","windows"],"goos":"windows","goarch":"amd64","goamd64":"v3","output":"amd64"},
+      {"tags":["core","desktop","windows"],"goos":"windows","goarch":"arm64","output":"arm64"},
+
+      {"tags":["freebsd"],"goos":"freebsd","goarch":"386","output":"386"},
+      {"tags":["freebsd"],"goos":"freebsd","goarch":"amd64","goamd64":"v1","output":"amd64-compatible"},
+      {"tags":["freebsd"],"goos":"freebsd","goarch":"amd64","goamd64":"v3","output":"amd64"},
+      {"tags":["freebsd"],"goos":"freebsd","goarch":"arm64","output":"arm64"},
+
+      {"tags":["android"],"goos":"android","goarch":"386","ndk":"i686-linux-android24","output":"386"},
+      {"tags":["android"],"goos":"android","goarch":"amd64","ndk":"x86_64-linux-android24","output":"amd64"},
+      {"tags":["android"],"goos":"android","goarch":"arm","ndk":"armv7a-linux-androideabi24","output":"armv7"},
+      {"tags":["android"],"goos":"android","goarch":"arm64","ndk":"aarch64-linux-android24","output":"arm64-v8"}
+    ]
+
+jobs:
+  prepare:
+    name: 准备编译矩阵
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      version: ${{ steps.gen.outputs.version }}
+      count: ${{ steps.gen.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 生成矩阵
+        id: gen
+        env:
+          INPUT_TARGETS: ${{ github.event.inputs.targets }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          TARGETS="${INPUT_TARGETS:-all}"
+          if [ "$TARGETS" = "all" ]; then
+            SEL=$(jq -c '[ .[] | select((.tags | index("android")) == null) ]' <<<"$MATRIX_JSON")
+          else
+            FILTER=$(tr ',' '\n' <<<"$TARGETS" | sed -E 's/^\s+|\s+$//g' | grep -v '^$' | jq -R . | jq -sc .)
+            SEL=$(jq -c --argjson f "$FILTER" \
+              '[ .[] | . as $e | select( ($e.tags | any(. as $t | ($f | index($t)) != null)) or (($f | index($e.goos)) != null) or (($f | index($e.output)) != null) ) ]' \
+              <<<"$MATRIX_JSON")
+          fi
+          COUNT=$(jq 'length' <<<"$SEL")
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::没有匹配的编译目标：$TARGETS"
+            exit 1
+          fi
+          echo "matrix={\"include\":$SEL}" >> "$GITHUB_OUTPUT"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "本次共编译 $COUNT 个目标"
+
+          VERSION="${INPUT_VERSION:-}"
+          if [ -z "$VERSION" ]; then
+            VERSION="${GITHUB_REF_NAME:-}"
+          fi
+          case "$VERSION" in
+            ""|Alpha|Alpha-ts|main|master) VERSION="v1.19.34-ts-$(git rev-parse --short HEAD)" ;;
+          esac
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "版本号：$VERSION"
+
+  build:
+    name: ${{ matrix.goos }}-${{ matrix.output }}
+    needs: prepare
+    runs-on: ubuntu-24.04
+    # android 需要 NDK，失败不拖累其他目标和发布
+    continue-on-error: ${{ matrix.goos == 'android' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+          # 需要给 老 macOS / Win7 出包时，可换成上游那套打了补丁的 Go：
+          # go-download-base-url: 'https://github.com/MetaCubeX/go/releases/download/build'
+
+      - name: 更新 CA 证书（随内核编译内置）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ca-certificates
+          sudo update-ca-certificates
+          cp -f /etc/ssl/certs/ca-certificates.crt component/ca/ca-certificates.crt
+
+      - name: 安装 NDK
+        if: matrix.goos == 'android'
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+
+      - name: 编译并打包
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOAMD64: ${{ matrix.goamd64 }}
+          GO386: ${{ matrix.go386 }}
+          GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
+        run: |
+          set -euo pipefail
+          echo "== ${GOOS}/${GOARCH} ${GOAMD64:-}${GO386:-}${GOARM:-}${GOMIPS:-} | ${VERSION}"
+          go version
+
+          BUILDTIME="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          EXTRA=""
+          if [ "$GOOS" = "android" ]; then
+            export CGO_ENABLED=1
+            export CC="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.ndk }}-clang"
+            echo "CC=$CC"
+          else
+            export CGO_ENABLED=0
+            EXTRA="-extldflags --static"
+          fi
+
+          go build -tags with_gvisor -trimpath \
+            -ldflags "${EXTRA} -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid="
+
+          NAME="mihomo-${GOOS}-${{ matrix.output }}"
+          mkdir -p dist
+          if [ "$GOOS" = "windows" ]; then
+            mv mihomo.exe "dist/${NAME}.exe"
+            ( cd dist && zip -9 -q "${NAME}-${VERSION}.zip" "${NAME}.exe" && rm -f "${NAME}.exe" )
+          else
+            mv mihomo "dist/${NAME}"
+            gzip -9 -c "dist/${NAME}" > "dist/${NAME}-${VERSION}.gz"
+            rm -f "dist/${NAME}"
+          fi
+          ls -lh dist
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: mihomo-${{ matrix.goos }}-${{ matrix.output }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  release:
+    name: 发布 Release
+    needs: [prepare, build]
+    if: ${{ github.event_name == 'push' || inputs.create_release == true }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 收集产物
+        uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
+      - name: 产物清单
+        run: ls -lh out
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.version }}
+          name: ${{ needs.prepare.outputs.version }} · Tailscale 增强版
+          prerelease: true
+          fail_on_unmatched_files: false
+          files: out/*
+          body: |
+            Tailscale 增强版内核（基于 MetaCubeX/mihomo ${{ needs.prepare.outputs.version }} 基线 + long2ice `feat/tailscale-advertise-routes` 的 4 个提交）。
+
+            编译参数：`-tags with_gvisor -trimpath`，静态链接（android 除外）。
+
+            用法（OpenWrt / luci-app-openclash）：
+            ```
+            gzip -d mihomo-linux-arm64-*.gz
+            mv mihomo-linux-arm64-* /etc/openclash/core/clash_meta
+            chmod +x /etc/openclash/core/clash_meta
+            ```
