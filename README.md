@@ -18,6 +18,20 @@
   </a>
 </p>
 
+> [!IMPORTANT]
+> **这是 Tailscale 增强分支 `Alpha-ts`** —— 基于上游最新 release（当前 `v1.19.34`），
+> 额外合入 4 个 Tailscale 相关提交，让内置的 userspace tailscale 节点能当路由器用：
+>
+> | 新增能力 | 配置项 |
+> |---|---|
+> | 把本机可达网段发布进 tailnet（subnet router） | `advertise-routes` |
+> | 固定 UDP 监听端口（默认 41641，与原生客户端一致） | `port` |
+> | 把 tailnet 入站转发到本机 loopback 服务 | `host-forward` |
+> | TUN 内 ping 走 Tailscale 真正发 ICMP echo | `NETWORK,ICMP` 规则 |
+>
+> 除 Tailscale 相关文件外，代码与主线一致。详细说明、配置示例、同步策略见
+> **[docs/ts-features.md](docs/ts-features.md)**，各平台二进制见 [Releases](https://github.com/jsntit/mihomo/releases)。
+
 ## Features
 
 - Local HTTP/HTTPS/SOCKS server with authentication support
