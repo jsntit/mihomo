@@ -22,8 +22,20 @@
 拉取：
 
 ```bash
-docker pull ghcr.io/jsntit/mihomo:v1.19.34-ts
+docker pull ghcr.io/jsntit/mihomo:v1.19.34-ts        # 多架构 index，按本机平台自动挑
 ```
+
+除了多架构 tag，每个平台还有自己的独立 tag，在 GHCR 版本列表里一眼能看出是哪个平台，
+也方便指定架构：
+
+```bash
+docker pull ghcr.io/jsntit/mihomo:v1.19.34-ts-amd64
+docker pull ghcr.io/jsntit/mihomo:v1.19.34-ts-arm64
+docker pull ghcr.io/jsntit/mihomo:v1.19.34-ts-armv7
+docker pull ghcr.io/jsntit/mihomo:v1.19.34-ts-386
+```
+
+这些 tag 指向的就是 index 里那四个子 manifest，digest 与 index 内的完全一致（不是复制出来的新镜像）。
 
 跑起来（配置目录挂进去，注意会盖掉镜像自带的 geo 文件，见下面注意事项）：
 
@@ -72,8 +84,11 @@ docker run -d --name mihomo --network host --cap-add NET_ADMIN \
 
 | 日期 | 版本 tag | 源 | 平台 | 镜像内自报版本 | 运行 |
 |---|---|---|---|---|---|
-| 2026-11-12 | `v1.19.34-ts` + `latest` | `Alpha-ts` | amd64 / arm64 / arm/v7 / 386 | `Mihomo Meta v1.19.34-ts linux amd64 with go1.26.10` | [43141749531](https://github.com/jsntit/mihomo/actions/runs/43141749531) |
-| 2026-11-12 | `v1.19.34` | `Alpha` | amd64 / arm64 / arm/v7 / 386 | `Mihomo Meta v1.19.34 linux amd64 with go1.26.10`（`strings` 里无 `advertise-routes`，确认是纯净主线） | [43142886442](https://github.com/jsntit/mihomo/actions/runs/43142886442) |
+| 2026-11-12 | `v1.19.34-ts` + `latest`（+ `-amd64` / `-arm64` / `-armv7` / `-386`） | `Alpha-ts` | amd64 / arm64 / arm/v7 / 386 | `Mihomo Meta v1.19.34-ts linux amd64 with go1.26.10` | [43144930113](https://github.com/jsntit/mihomo/actions/runs/43144930113) |
+| 2026-11-12 | `v1.19.34`（+ `-amd64` / `-arm64` / `-armv7` / `-386`） | `Alpha` | amd64 / arm64 / arm/v7 / 386 | `Mihomo Meta v1.19.34 linux amd64 with go1.26.10`（`strings` 里无 `advertise-routes`，确认是纯净主线） | [43145585635](https://github.com/jsntit/mihomo/actions/runs/43145585635) |
+
+平台 tag 指向的就是 index 里的子 manifest，digest 完全一致；GHCR 版本列表现在只剩 10 条，
+全部带 tag，没有悬空的 `sha256:` 条目。
 
 镜像层内的二进制逐个核过架构，不是把同一份 amd64 复制了四遍：
 
