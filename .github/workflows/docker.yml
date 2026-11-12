@@ -43,7 +43,8 @@ on:
       - "v*-ts"
 
 concurrency:
-  group: docker-${{ github.ref }}
+  # 带上 inputs.ref，否则同时发「主线」和「ts」两套时后一个会把前一个 cancel 掉
+  group: docker-${{ github.ref }}-${{ github.event.inputs.ref }}
   cancel-in-progress: true
 
 env:
@@ -259,6 +260,38 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # 关掉证明（attestation）与 SBOM：它们会在 index 里塞进 platform=unknown/unknown 的条目，
+          # GHCR 版本列表里就多出一串没有 tag、看不出是什么的 sha256。关掉后 index 只剩真实平台。
+          provenance: false
+          sbom: false
+
+      - name: 给每个平台打独立 tag
+        if: needs.prepare.outputs.push == 'true'
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          # 子 manifest 默认没有 tag，GHCR 上只看得到 sha256。给每个平台补一个
+          # <版本>-<arch> 的 tag（amd64 / arm64 / armv7 / 386 / riscv64），一眼能认出来。
+          RAW=$(docker buildx imagetools inspect --raw "${IMAGE}:${VERSION}")
+          ENTRIES=$(jq -r '.manifests[]
+            | select(.platform.architecture != "unknown")
+            | "\(.platform.architecture)|\(.platform.variant // "")|\(.digest)"' <<<"$RAW")
+          if [ -z "$ENTRIES" ]; then
+            echo "::error::index 里没有可用的平台 manifest"
+            exit 1
+          fi
+          while IFS='|' read -r arch variant digest; do
+            [ -n "${arch:-}" ] || continue
+            case "$arch" in
+              arm) if [ -n "$variant" ]; then name="arm${variant}"; else name="arm"; fi ;;
+              *)   name="$arch" ;;
+            esac
+            echo "tag ${VERSION}-${name} -> ${digest}"
+            docker buildx imagetools create -t "${IMAGE}:${VERSION}-${name}" "${IMAGE}@${digest}"
+          done <<<"$ENTRIES"
+          echo "平台 tag 打完"
 
       - name: 写入 Job Summary
         if: always()
@@ -286,6 +319,13 @@ jobs:
               echo ""
               echo '```bash'
               echo "docker pull ${IMAGE}:${VERSION}"
+              echo "# 指定平台（子 manifest 也有独立 tag，GHCR 版本列表里能直接认出来）"
+              for p in $(echo "$PLATFORMS" | tr ',' ' '); do
+                case "$p" in
+                  linux/arm/v*) echo "docker pull ${IMAGE}:${VERSION}-arm${p##*/v}" ;;
+                  *)            echo "docker pull ${IMAGE}:${VERSION}-${p##*/}" ;;
+                esac
+              done
               echo '```'
               echo ""
               echo "包默认继承上一次的可见性；首次推送若显示私有，去 GitHub → Your packages → mihomo → Package settings 改 Public。"
