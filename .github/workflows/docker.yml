@@ -1,16 +1,19 @@
 name: Docker (GHCR)
 
-# 手动触发：Actions → Docker (GHCR) → Run workflow
+# 触发方式：
+#   1) 手动：Actions → Docker (GHCR) → Run workflow
+#   2) 自动：push 一个 v*-ts 的 tag（发版即出镜像，ref/版本号自动取该 tag）
 #
 # 流程：
-#   1) 按平台交叉编译出 bin/mihomo-linux-<arch>-<版本>.gz（命名与仓库自带 docker/file-name.sh 的约定一致）
-#   2) 用仓库自带 Dockerfile 打多架构镜像，推送到 ghcr.io/<owner>/mihomo
+#   prepare  → 解析 ref / 版本 / 平台矩阵
+#   binaries → 按平台交叉编译出 bin/mihomo-linux-<arch>-<版本>.gz（命名对齐 docker/file-name.sh）
+#   image    → 用仓库自带 Dockerfile 打多架构镜像，推送到 ghcr.io/<owner>/mihomo
 #
 # 认证：只用 GITHUB_TOKEN（permissions.packages: write），不需要额外 secret。
 #
-# 两个常用场景：
-#   ref=Alpha-ts, version=v1.19.34-ts  → 带 Tailscale 增强的镜像
-#   ref=Alpha,    version=v1.19.34     → 纯净主线镜像（tag_latest 建议其中只有一个开）
+# 两种常用组合：
+#   ref=Alpha-ts, version=v1.19.34-ts → 带 Tailscale 增强的镜像（当前 latest）
+#   ref=Alpha,    version=v1.19.34    → 纯净主线镜像（tag_latest 关掉，别抢 latest）
 
 on:
   workflow_dispatch:
@@ -35,9 +38,12 @@ on:
         description: "推送到 GHCR（关闭则只构建不推送，用来验证）"
         type: boolean
         default: true
+  push:
+    tags:
+      - "v*-ts"
 
 concurrency:
-  group: docker-${{ github.ref }}-${{ github.event.inputs.ref }}
+  group: docker-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -50,30 +56,46 @@ permissions:
 
 jobs:
   prepare:
-    name: 解析版本 / 平台
+    name: 解析 ref / 版本 / 平台
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
       version: ${{ steps.gen.outputs.version }}
       image: ${{ steps.gen.outputs.image }}
+      ref: ${{ steps.gen.outputs.ref }}
+      platforms: ${{ steps.gen.outputs.platforms }}
+      tag_latest: ${{ steps.gen.outputs.tag_latest }}
+      push: ${{ steps.gen.outputs.push }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          # push 事件下输入为空，用触发它的 ref（tag）；dispatch 时用指定 ref
+          ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 0
 
-      - name: 生成平台矩阵
+      - name: 生成矩阵与元信息
         id: gen
         env:
-          INPUT_PLATFORMS: ${{ inputs.platforms }}
-          INPUT_VERSION: ${{ inputs.version }}
           INPUT_REF: ${{ inputs.ref }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PLATFORMS: ${{ inputs.platforms }}
+          INPUT_TAG_LATEST: ${{ inputs.tag_latest }}
+          INPUT_PUSH: ${{ inputs.push }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
 
+          # ---- 源 ref ----
+          REF="${INPUT_REF:-$REF_NAME}"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "源 ref：$REF（event=${{ github.event_name }}）"
+
           # ---- 平台 -> Go 编译参数 + 产物命名（必须与 docker/file-name.sh 对齐）----
+          PLATFORMS="${INPUT_PLATFORMS:-linux/amd64,linux/arm64,linux/arm/v7,linux/386}"
+          echo "platforms=$PLATFORMS" >> "$GITHUB_OUTPUT"
+
           SEL="[]"
-          echo "$INPUT_PLATFORMS" | tr ',' '\n' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g' | grep -v '^$' > /tmp/platforms.txt
+          echo "$PLATFORMS" | tr ',' '\n' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g' | grep -v '^$' > /tmp/platforms.txt
           while read -r p; do
             case "$p" in
               linux/amd64)   j='{"platform":"linux/amd64","goos":"linux","goarch":"amd64","goamd64":"v1","output":"amd64-v1"}' ;;
@@ -91,18 +113,26 @@ jobs:
           echo "本镜像平台：$(jq -r '.[].platform' <<<"$SEL" | paste -sd, -)"
           echo "matrix={\"include\":$SEL}" >> "$GITHUB_OUTPUT"
 
-          # ---- 版本号 ----
+          # ---- 版本号：优先用输入，其次 git describe（tag 触发时正好是 tag 名）----
           VERSION="$INPUT_VERSION"
           if [ -z "$VERSION" ]; then
             VERSION=$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "版本号：$VERSION（ref=$INPUT_REF）"
+          echo "版本号：$VERSION"
+
+          # ---- 布尔开关：dispatch 用输入值；push 事件下输入为空 -> 默认 true ----
+          TAG_LATEST="${INPUT_TAG_LATEST:-true}"
+          DO_PUSH="${INPUT_PUSH:-true}"
+          case "$TAG_LATEST" in true|false) ;; *) TAG_LATEST=true ;; esac
+          case "$DO_PUSH" in true|false) ;; *) DO_PUSH=true ;; esac
+          echo "tag_latest=$TAG_LATEST" >> "$GITHUB_OUTPUT"
+          echo "push=$DO_PUSH" >> "$GITHUB_OUTPUT"
 
           # ---- 镜像地址（Docker 要求全小写）----
           IMAGE="${REGISTRY}/$(echo "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')"
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
-          echo "镜像：$IMAGE"
+          echo "镜像：$IMAGE（latest=$TAG_LATEST, push=$DO_PUSH）"
 
   binaries:
     name: 编译 ${{ matrix.platform }}
@@ -114,7 +144,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ needs.prepare.outputs.ref }}
 
       - name: 安装 Go
         uses: actions/setup-go@v5
@@ -160,7 +190,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ needs.prepare.outputs.ref }}
 
       - name: 收集各平台产物到 bin/
         uses: actions/download-artifact@v4
@@ -171,7 +201,7 @@ jobs:
       - name: 自检产物命名
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
-          PLATFORMS: ${{ inputs.platforms }}
+          PLATFORMS: ${{ needs.prepare.outputs.platforms }}
         run: |
           set -euo pipefail
           echo "$VERSION" > bin/version.txt
@@ -194,7 +224,7 @@ jobs:
         uses: docker/setup-buildx-action@v4
 
       - name: 登录 GHCR
-        if: inputs.push
+        if: needs.prepare.outputs.push == 'true'
         uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
@@ -210,10 +240,10 @@ jobs:
             latest=false
           tags: |
             type=raw,value=${{ needs.prepare.outputs.version }}
-            type=raw,value=latest,enable=${{ inputs.tag_latest }}
+            type=raw,value=latest,enable=${{ needs.prepare.outputs.tag_latest == 'true' }}
           labels: |
             org.opencontainers.image.title=mihomo
-            org.opencontainers.image.description=mihomo core built from ${{ inputs.ref }}
+            org.opencontainers.image.description=mihomo core built from ${{ needs.prepare.outputs.ref }}
             org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
 
@@ -223,8 +253,8 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: ${{ inputs.platforms }}
-          push: ${{ inputs.push }}
+          platforms: ${{ needs.prepare.outputs.platforms }}
+          push: ${{ needs.prepare.outputs.push == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -233,12 +263,12 @@ jobs:
       - name: 写入 Job Summary
         if: always()
         env:
-          REF: ${{ inputs.ref }}
+          REF: ${{ needs.prepare.outputs.ref }}
           VERSION: ${{ needs.prepare.outputs.version }}
           IMAGE: ${{ needs.prepare.outputs.image }}
-          PLATFORMS: ${{ inputs.platforms }}
+          PLATFORMS: ${{ needs.prepare.outputs.platforms }}
           DIGEST: ${{ steps.build.outputs.digest }}
-          PUSHED: ${{ inputs.push }}
+          PUSHED: ${{ needs.prepare.outputs.push }}
         run: |
           {
             echo "## mihomo Docker 镜像"
@@ -258,7 +288,7 @@ jobs:
               echo "docker pull ${IMAGE}:${VERSION}"
               echo '```'
               echo ""
-              echo "首次推送后，包默认是私有的，去 GitHub 右上角头像 → Your packages → mihomo → Package settings 里改成 Public。"
+              echo "包默认继承上一次的可见性；首次推送若显示私有，去 GitHub → Your packages → mihomo → Package settings 改 Public。"
             else
               echo "本次未推送（push=false），仅验证构建。"
             fi
