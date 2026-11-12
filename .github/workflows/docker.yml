@@ -274,24 +274,59 @@ jobs:
           set -euo pipefail
           # 子 manifest 默认没有 tag，GHCR 上只看得到 sha256。给每个平台补一个
           # <版本>-<arch> 的 tag（amd64 / arm64 / armv7 / 386 / riscv64），一眼能认出来。
-          RAW=$(docker buildx imagetools inspect --raw "${IMAGE}:${VERSION}")
-          ENTRIES=$(jq -r '.manifests[]
-            | select(.platform.architecture != "unknown")
-            | "\(.platform.architecture)|\(.platform.variant // "")|\(.digest)"' <<<"$RAW")
+          #
+          # 千万不能用 `docker buildx imagetools create` 来打子 manifest 的 tag：它会重新编码
+          # manifest（OCI -> Docker schema2），digest 随之改变，于是每个平台都会多出一份内容
+          # 相同、digest 不同的重复版本，列表里的无 tag digest 反而更多。
+          # 这里直接走 registry API，把原始 manifest 字节原样 PUT 到新 tag 下，digest 保持不变。
+          REG="${IMAGE%%/*}"
+          REPO_PATH="${IMAGE#*/}"
+          AUTH=$(jq -r --arg r "$REG" '.auths[$r].auth // empty' "$HOME/.docker/config.json")
+          if [ -z "$AUTH" ]; then
+            echo "::error::在 $HOME/.docker/config.json 里找不到 $REG 的登录凭据"
+            exit 1
+          fi
+          TOK=$(curl -sf -u "$(echo "$AUTH" | base64 -d)" \
+            "https://${REG}/token?service=${REG}&scope=repository:${REPO_PATH}:pull,push" | jq -r .token)
+          IDX_ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json"
+          MAN_ACCEPT="application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json"
+
+          ENTRIES=$(curl -sf -H "Authorization: Bearer $TOK" -H "Accept: $IDX_ACCEPT" \
+            "https://${REG}/v2/${REPO_PATH}/manifests/${VERSION}" \
+            | jq -r '.manifests[]
+              | select(.platform.architecture != "unknown")
+              | "\(.platform.architecture)|\(.platform.variant // "")|\(.digest)"')
           if [ -z "$ENTRIES" ]; then
             echo "::error::index 里没有可用的平台 manifest"
             exit 1
           fi
+
           while IFS='|' read -r arch variant digest; do
             [ -n "${arch:-}" ] || continue
             case "$arch" in
               arm) if [ -n "$variant" ]; then name="arm${variant}"; else name="arm"; fi ;;
               *)   name="$arch" ;;
             esac
-            echo "tag ${VERSION}-${name} -> ${digest}"
-            docker buildx imagetools create -t "${IMAGE}:${VERSION}-${name}" "${IMAGE}@${digest}"
+            tag="${VERSION}-${name}"
+            CT=$(curl -sf -o /tmp/platform.json -D /tmp/platform.hdr \
+                   -H "Authorization: Bearer $TOK" -H "Accept: $MAN_ACCEPT" \
+                   "https://${REG}/v2/${REPO_PATH}/manifests/${digest}" \
+                 && grep -i '^content-type:' /tmp/platform.hdr | tr -d '\r' | awk '{print $2}')
+            curl -sf -o /dev/null -X PUT \
+              -H "Authorization: Bearer $TOK" -H "Content-Type: ${CT}" \
+              --data-binary @/tmp/platform.json \
+              "https://${REG}/v2/${REPO_PATH}/manifests/${tag}"
+            # 复核：新 tag 的 digest 必须与原 digest 一模一样，否则说明又被重新编码了
+            GOT=$(curl -sfI -H "Authorization: Bearer $TOK" -H "Accept: $MAN_ACCEPT" \
+                    "https://${REG}/v2/${REPO_PATH}/manifests/${tag}" \
+                  | grep -i '^docker-content-digest:' | tr -d '\r' | awk '{print $2}')
+            if [ "$GOT" != "$digest" ]; then
+              echo "::error::${tag} 的 digest 变了：${GOT:-<无>} != ${digest}"
+              exit 1
+            fi
+            echo "tag ${tag} -> ${digest} (${CT})"
           done <<<"$ENTRIES"
-          echo "平台 tag 打完"
+          echo "平台 tag 打完，digest 全部保持一致"
 
       - name: 写入 Job Summary
         if: always()
