@@ -69,9 +69,9 @@ docker run -d --name mihomo --network host --cap-add NET_ADMIN \
 - **包可见性**：本仓库这套流程首次推送后，实测包是 `public`；若显示私有，去
   GitHub → 头像 → Your packages → `mihomo` → Package settings → Change visibility 改成 Public。
   私有包拉取需要 `docker login ghcr.io -u <user> -p <PAT with read:packages>`。
-- **index 里会多出 4 个 `unknown/unknown` 条目**：那是 buildx 默认生成的 provenance 证明（每个平台一个），
-  不是多出来的架构，`docker pull` 会按本机平台自己挑。要彻底干净可以在
-  `docker/build-push-action` 里加 `provenance: false`（代价是失去构建溯源）。
+- **provenance / sbom 已关闭**：buildx 默认会给每个平台生成 attestation，在 index 里表现为
+  `platform=unknown/unknown` 的额外 4 个条目，且都没有 tag，GHCR 版本列表里又是一串看不懂的
+  `sha256:`。工作流里已设 `provenance: false` + `sbom: false`，要恢复构建溯源把这两行删掉即可。
 - **`latest` 只有一个**：谁最后跑谁占。同时维护 ts 与主线两套镜像时，最好只给一套开 `tag_latest`。
 - 镜像内含 `geoip.metadb` / `geosite.dat` / `geoip.dat`，是**构建时**从
   [meta-rules-dat](https://github.com/MetaCubeX/meta-rules-dat) 拉的最新版，配置目录是 `/root/.config/mihomo/`。
@@ -97,5 +97,43 @@ docker run -d --name mihomo --network host --cap-add NET_ADMIN \
 | `linux/amd64` | ELF 64-bit LSB executable, x86-64, statically linked, stripped |
 | `linux/arm64` | ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped |
 | `linux/arm/v7` | ELF 32-bit LSB executable, ARM, EABI5, statically linked, stripped |
+
+## 运行验证
+
+不只是 `-v` 打印版本，两个镜像里的二进制都实际启动跑过（从镜像层里解出 `/mihomo`，
+用 `mixed-port: 27890` / `socks-port: 27891` / `external-controller: 127.0.0.1:29090` 启动）：
+
+| 检查项 | ts 镜像（`v1.19.34-ts`） | 主线镜像（`v1.19.34`） |
+|---|---|---|
+| `GET /version` | `{"meta":true,"version":"v1.19.34-ts"}` | `{"meta":true,"version":"v1.19.34"}` |
+| HTTP 代理出网 | `204`（gstatic generate_204，81ms） | — |
+| SOCKS5 出网 | `200`（api.github.com，231ms） | — |
+| 端口监听 | 27890 / 27891 / 29090 全部 LISTEN | — |
+
+### ts 与主线是两套内核的差分证据
+
+拿同一份带 ts 专属字段的配置分别喂给两个内核 `-t`（只校验配置、不联网）：
+
+| 配置 | ts 内核 | 主线内核 |
+|---|---|---|
+| 合法：`advertise-routes: [192.168.99.0/24]` + `host-forward` | ✅ `test is successful` | ✅ `test is successful` |
+| 非法 CIDR：`192.168.99.0/33` | ❌ `invalid tailscale advertise-routes prefix` | ✅ **仍然 successful** |
+| 非 loopback 转发目标：`target: 192.168.1.5` | ❌ `host-forward.target must be a loopback IP` | ✅ **仍然 successful** |
+
+结论：ts 内核真的在解析并校验这两个字段，主线内核**静默忽略**它们。
+所以把 ts 的配置原样丢给主线镜像不会报任何错，只是那几行不生效 —— 这一点比报错更容易踩坑。
+
+`strings` 计数同样对得上：`advertise-routes` ts 5 处 / 主线 0 处，`host-forward` ts 2 处 / 主线 0 处。
+
+> `host-forward` 是 **map** 不是 list（`enabled` / `target` / `tcp` / `udp`），写成 list 会报
+> `'host-forward' expected a map, got 'slice'`。
+
+### riscv64
+
+`linux/riscv64` 用 `push=false` 单独跑过一次（[43146967993](https://github.com/jsntit/mihomo/actions/runs/43146967993)）：
+`编译 linux/riscv64` 与 `自检产物命名` 都通过（说明 `mihomo-linux-riscv64-<ver>.gz` 与
+`docker/file-name.sh` 的期望一致），`登录 GHCR` 与 `给每个平台打独立 tag` 两步被 skip，
+确认只构建、没往 registry 写任何东西。没有真正 push 是因为 riscv64 会单开一个 index，
+混进现有 tag 会覆盖掉四平台的 index；要用的话单独换个版本号发。
 
 
