@@ -19,10 +19,29 @@
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `ref` | `Alpha-ts` | 打包哪个分支/tag。`Alpha-ts` = 带 Tailscale 增强；`Alpha` = 纯净主线 |
-| `version` | 空 | 写进内核 `Version` 与镜像 tag；留空则按「tag 名 → 分支 describe → 短 sha」推断 |
+| `version` | `v1.19.34-ts` | 写进内核 `Version` 与镜像 tag。**默认值就是当前 ts 基线**，手动跑不改也能出对版本；清空则按「tag 名 → 分支 describe → 短 sha」自动推断 |
 | `platforms` | `linux/amd64,linux/arm64,linux/arm/v7,linux/386` | 可加 `linux/riscv64`。只用 `docker/file-name.sh` 支持的这五个 |
 | `tag_latest` | `true` | 额外打 `latest`。**两套镜像同时维护时，只给其中一套开** |
 | `push` | `true` | 关掉则只构建不推送，用于验证 |
+
+### 三个带默认值的输入，怎么用
+
+`ref` / `version` / `platforms` 都**预填了当前基线**，所以日常手动跑**什么都不用改，直接 Run**：
+
+| 场景 | 该怎么做 |
+|---|---|
+| 就想出当前这版 ts 镜像 | 什么都不改，直接 Run |
+| 想把版本号交给自动推断 | 把 `version` 清空（得到 `v1.19.34-ts-Alpha-ts-<sha>`） |
+| 上游升级、ts 补丁已重放 | 改 `version`（如 `v1.19.35-ts`），同时改 `BASELINE` |
+| 只想验证构建不推送 | `push` 关掉 |
+
+默认值**只在手动触发时生效**；`push` tag 与定时巡检走的是自动推断分支，不受影响
+（脚本里把 `inputs.*` 的 `null` / 空串都归一到空值再判断，避免默认值漏进自动流程）。
+
+> **`git describe` 的坑**：仓库里除了 `v1.19.34` 这类版本 tag，还有 `Prerelease-Alpha`
+> 这种非版本 tag，而且它和 `v1.19.34` 指向同一个 commit —— 距离相等时 `describe` 会挑到
+> `Prerelease-Alpha`，于是版本号里取不到任何数字。所以自动推断用的是
+> `git describe --tags --abbrev=0 --match 'v[0-9]*'`，只认 `v<数字>` 开头的 tag。
 
 ### `BASELINE` 文件
 

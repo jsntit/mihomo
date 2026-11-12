@@ -30,9 +30,9 @@ on:
         required: true
         default: "Alpha-ts"
       version:
-        description: "版本号，同时写入内核 Version 与镜像 tag（留空则用 git describe 结果）"
+        description: "版本号，同时写入内核 Version 与镜像 tag。默认 v1.19.34-ts（当前 ts 基线）；留空则自动推断（tag 名 / 分支+短sha）"
         required: false
-        default: ""
+        default: "v1.19.34-ts"
       platforms:
         description: "平台列表（逗号分隔）。Dockerfile 只认 linux/amd64、linux/arm64、linux/arm/v7、linux/386、linux/riscv64"
         required: false
@@ -100,6 +100,9 @@ jobs:
           set -euo pipefail
 
           # ---- 源 ref ----
+          # inputs 只有 workflow_dispatch 才有值，先把 null/空串归一成空（原因见下面版本号注释）
+          INPUT_REF="${INPUT_REF:-}"
+          case "$INPUT_REF" in null|"~") INPUT_REF="" ;; esac
           REF="${INPUT_REF:-$REF_NAME}"
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
           echo "源 ref：$REF（event=${{ github.event_name }}）"
@@ -133,12 +136,22 @@ jobs:
           # 不能只靠 `git describe --tags --always`：tag 之后分支再提交，它会返回
           # `v1.19.34-ts-1-g5ed6d33` 这种「tag+N-ghash」，于是镜像 tag 里出现带 `+` 的
           # 非法字符、自动触发出来的镜像版本号也是一串看不懂的东西。
+          #
+          # inputs 上下文按官方文档「只在 workflow_dispatch 可用」；非手动触发时它到底是
+          # 空串还是字符串 "null" 文档没写死，所以这里先把 null/空串都归一成空值，
+          # 否则视图里的默认值会漏进定时巡检，把每次巡检的版本号都钉成同一个。
+          INPUT_VERSION="${INPUT_VERSION:-}"
+          case "$INPUT_VERSION" in null|"~") INPUT_VERSION="" ;; esac
+
           VERSION="$INPUT_VERSION"
-          if [ -z "$VERSION" ] && [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+          if [ -z "$VERSION" ] && [ "${REF_TYPE:-}" = "tag" ]; then
             VERSION="$REF_NAME"
           fi
           if [ -z "$VERSION" ]; then
-            VERSION=$(git describe --tags --abbrev=0 2>/dev/null || git rev-parse --short HEAD)
+            # 必须带 --match 'v[0-9]*'：仓库里还有 Prerelease-Alpha 这类非版本 tag，
+            # 且它与 v1.19.34 指向同一个 commit，距离相等时 describe 会挑到它，
+            # 于是取不到数字部分，版本号变成一串没版本的东西。
+            VERSION=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || git rev-parse --short HEAD)
             # 分支（非 tag）上构建：版本号加分支后缀与短 sha，避免覆盖已发版的同名镜像
             if [ "$VERSION" != "$(git rev-parse --short HEAD)" ]; then
               SHORT=$(git rev-parse --short HEAD)
@@ -152,15 +165,21 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "版本号：$VERSION"
 
-          # ---- 布尔开关：dispatch 用输入值；push 事件下输入为空 ----
+          # ---- 布尔开关：dispatch 用输入值；push / schedule 事件下输入为空 ----
           # tag 触发的版本是显式发布的，抢 latest 合理；分支自动构建不抢，免得主线构建把
           # ts 的 latest 顶掉（两个 workflow 各自构建，谁最后跑谁占 latest）。
+          #
+          # 注意 inputs 在非 dispatch 事件下可能是字符串 "null" 而不是空串 —— 不归一化的话
+          # 它会落进下面 case 的 *) 分支被当成 true，于是每周巡检都去抢 latest。
           TAG_LATEST="${INPUT_TAG_LATEST:-}"
+          case "$TAG_LATEST" in null|"~"|"") TAG_LATEST="" ;; esac
+          DO_PUSH="${INPUT_PUSH:-}"
+          case "$DO_PUSH" in null|"~"|"") DO_PUSH="" ;; esac
           if [ -z "$TAG_LATEST" ]; then
-            if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then TAG_LATEST=true; else TAG_LATEST=false; fi
+            if [ "${REF_TYPE:-}" = "tag" ]; then TAG_LATEST=true; else TAG_LATEST=false; fi
           fi
-          DO_PUSH="${INPUT_PUSH:-true}"
-          case "$TAG_LATEST" in true|false) ;; *) TAG_LATEST=true ;; esac
+          [ -z "$DO_PUSH" ] && DO_PUSH=true
+          case "$TAG_LATEST" in true|false) ;; *) TAG_LATEST=false ;; esac
           case "$DO_PUSH" in true|false) ;; *) DO_PUSH=true ;; esac
           echo "tag_latest=$TAG_LATEST" >> "$GITHUB_OUTPUT"
           echo "push=$DO_PUSH" >> "$GITHUB_OUTPUT"
