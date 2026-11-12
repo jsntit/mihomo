@@ -16,7 +16,6 @@
 | `ref` | `Alpha-ts` | 打包哪个分支/tag。`Alpha-ts` = 带 Tailscale 增强；`Alpha` = 纯净主线 |
 | `version` | 空 | 写进内核 `Version` 与镜像 tag；留空则用 `git describe` |
 | `platforms` | `linux/amd64,linux/arm64,linux/arm/v7,linux/386` | 可加 `linux/riscv64`。只用 `docker/file-name.sh` 支持的这五个 |
-
 | `tag_latest` | `true` | 额外打 `latest`。**两套镜像同时维护时，只给其中一套开** |
 | `push` | `true` | 关掉则只构建不推送，用于验证 |
 
@@ -24,6 +23,14 @@
 
 ```bash
 docker pull ghcr.io/jsntit/mihomo:v1.19.34-ts
+```
+
+跑起来（配置目录挂进去，注意会盖掉镜像自带的 geo 文件，见下面注意事项）：
+
+```bash
+docker run -d --name mihomo --network host --cap-add NET_ADMIN \
+  -v /opt/mihomo:/root/.config/mihomo \
+  ghcr.io/jsntit/mihomo:v1.19.34-ts -d /root/.config/mihomo
 ```
 
 两套镜像建议的 tag 方案：
@@ -44,6 +51,9 @@ docker pull ghcr.io/jsntit/mihomo:v1.19.34-ts
 
 ## 注意事项
 
+- **别手动跑上游那个 `Build` 工作流**：它末尾有个 `Docker` job 往 Docker Hub（`docker.io/jsntit/mihomo`）
+  推镜像，依赖 `DOCKER_HUB_USER` / `DOCKER_HUB_TOKEN` 两个 secret，本 fork 没配，跑到那步会 login 失败。
+  要出二进制用 **`Build (ts)`**，要出镜像用 **`Docker (GHCR)`**。
 - **包可见性**：本仓库这套流程首次推送后，实测包是 `public`；若显示私有，去
   GitHub → 头像 → Your packages → `mihomo` → Package settings → Change visibility 改成 Public。
   私有包拉取需要 `docker login ghcr.io -u <user> -p <PAT with read:packages>`。
@@ -64,4 +74,13 @@ docker pull ghcr.io/jsntit/mihomo:v1.19.34-ts
 |---|---|---|---|---|---|
 | 2026-11-12 | `v1.19.34-ts` + `latest` | `Alpha-ts` | amd64 / arm64 / arm/v7 / 386 | `Mihomo Meta v1.19.34-ts linux amd64 with go1.26.10` | [43141749531](https://github.com/jsntit/mihomo/actions/runs/43141749531) |
 | 2026-11-12 | `v1.19.34` | `Alpha` | amd64 / arm64 / arm/v7 / 386 | `Mihomo Meta v1.19.34 linux amd64 with go1.26.10`（`strings` 里无 `advertise-routes`，确认是纯净主线） | [43142886442](https://github.com/jsntit/mihomo/actions/runs/43142886442) |
+
+镜像层内的二进制逐个核过架构，不是把同一份 amd64 复制了四遍：
+
+| 平台 | `file` 结果 |
+|---|---|
+| `linux/amd64` | ELF 64-bit LSB executable, x86-64, statically linked, stripped |
+| `linux/arm64` | ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped |
+| `linux/arm/v7` | ELF 32-bit LSB executable, ARM, EABI5, statically linked, stripped |
+
 
