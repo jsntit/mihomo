@@ -7,11 +7,46 @@
 ## 与主线的关系
 
 - **基线**：始终是上游最新 release 的 commit（当前 `v1.19.34` / `0455d0d2`）。
-- **额外内容**：把 [long2ice/mihomo](https://github.com/long2ice/mihomo) 的
-  `feat/tailscale-advertise-routes` 分支上的 4 个提交重放（cherry-pick）到基线上，
-  外加一个 CI 工作流。
+- **额外内容**：上游待合并 PR 里的 4 个 Tailscale 提交（来源见下一节），外加一个 CI 工作流。
 - 相对基线的代码差异：**12 个新增文件 + 11 个修改文件，+1828 / −29**。
   除 Tailscale 相关文件和 `docs/config.yaml` 注释外，其余代码与主线完全一致。
+
+## 来源：这些功能是从哪同步的
+
+**不是自己写的，全部来自上游还没合并的 PR**，我们只是把它重放到 release tag 上：
+
+| 环节 | 位置 | 状态 |
+|---|---|---|
+| 需求 | MetaCubeX/mihomo issue [#2829](https://github.com/MetaCubeX/mihomo/issues/2829)（作者 [@jsntit](https://github.com/jsntit)，2026-05-24） | open |
+| 实现 | PR [#3248](https://github.com/MetaCubeX/mihomo/pull/3248) by [@long2ice](https://github.com/long2ice)，base `Alpha` | **open，未合并** |
+| 代码分支 | `long2ice/mihomo` → `feat/tailscale-advertise-routes`，HEAD `1d4aedd6`（2026-10-05） | 已停止更新 |
+| 文档 | MetaCubeX/Meta-Docs PR [#222](https://github.com/MetaCubeX/Meta-Docs/pull/222) | open |
+
+PR 共 5 个提交 / 22 个文件，其中 4 个是功能提交，逐个 cherry-pick 到 `v1.19.34` 上：
+
+| # | 功能 | 原始提交（long2ice） | 本分支重放后 | 日期 |
+|---|---|---|---|---|
+| 1 | `advertise-routes` 发布子网路由 | `560f713c` | `86bc4d17` | 2026-09-26 |
+| 2 | TUN ICMP echo 经 Tailscale 发送 | `241f5aa2` | `f34b10dd` | 2026-09-26 |
+| 3 | `port` 固定 UDP 端口（默认 41641） | `f2284736` | `0d167128` | 2026-09-28 |
+| 4 | `host-forward` 入站转发到 loopback | `1d4aedd6` | `5a700660` | 2026-10-05 |
+
+第 4 项是 PR 讨论里 [@UnlastingR](https://github.com/UnlastingR) 提出的 FlClash / Android 场景，
+作者追加提交实现的。
+
+**没有同步进来的部分**：
+
+- `e16badcc`（PR 第 5 个提交）是 `merge Alpha into Tailscale feature branch`，纯同步动作，不需要；
+- 分支的基点 `63bd52ec`（wwqgtxx 改默认 IP stack / congestion-controller）本来就是上游提交，
+  已经包含在 `v1.19.34` 里，不存在需要额外带的东西。
+
+**为什么用 cherry-pick 而不是直接 merge 分支**：该分支基于 `63bd52ec`（2026-09-27），
+比当前基线落后一个半月，并且自带 merge commit；直接 merge 会把无关历史一起带进来。
+挑功能提交重放后历史是直线，`git diff v1.19.34..HEAD` 正好等于补丁集，
+`Author` 仍是原作者，提交信息里的 `cherry picked from` 保留原始 SHA 可回溯。
+
+**上游合并后就可以退役本分支**：一旦 PR #3248 合进 `Alpha` 并出现在 release 里，
+删掉这 4 个提交直接跟随主线即可，不需要长期分叉。
 
 ## 功能对比
 
@@ -126,6 +161,8 @@ mihomo-<goos>-<output>-<版本>.gz    # windows 为 .zip
 
 上游发新版后：
 
+0. 先看 PR [#3248](https://github.com/MetaCubeX/mihomo/pull/3248) 是否已经合并 ——
+   合并了就别再打 4 个补丁，直接跟主线；
 1. 在临时 worktree 里把 4 个提交 cherry-pick 到新 tag 上，先确认会不会冲突；
 2. 无冲突就在 `sync-<版本>` 分支上重放，然后 **merge 回 `Alpha-ts`**（不要 rebase / force-push，
    否则基线到分支的提交范围会乱）；

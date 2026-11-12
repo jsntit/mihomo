@@ -20,7 +20,9 @@
 
 > [!IMPORTANT]
 > **这是 Tailscale 增强分支 `Alpha-ts`** —— 基于上游最新 release（当前 `v1.19.34`），
-> 额外合入 4 个 Tailscale 相关提交，让内置的 userspace tailscale 节点能当路由器用：
+> 额外合入上游待合并 PR [#3248](https://github.com/MetaCubeX/mihomo/pull/3248)
+> （作者 [@long2ice](https://github.com/long2ice)）的 4 个 Tailscale 提交，
+> 让内置的 userspace tailscale 节点能当路由器用：
 >
 > | 新增能力 | 配置项 |
 > |---|---|
