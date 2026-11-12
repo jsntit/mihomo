@@ -5,13 +5,18 @@
 
 ## 用法
 
-Actions → **Docker (GHCR)** → Run workflow。
+两种触发方式：
+
+1. **手动**：Actions → **Docker (GHCR)** → Run workflow，按下表填参数。
+2. **自动**：push 一个 `v*-ts` 的 tag，就会跟着 `Build (ts)` 一起出镜像 ——
+   此时 `ref` 取该 tag、`version` 取 tag 名（`git describe` 的结果正好是 tag）、`tag_latest=true`。
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `ref` | `Alpha-ts` | 打包哪个分支/tag。`Alpha-ts` = 带 Tailscale 增强；`Alpha` = 纯净主线 |
 | `version` | 空 | 写进内核 `Version` 与镜像 tag；留空则用 `git describe` |
 | `platforms` | `linux/amd64,linux/arm64,linux/arm/v7,linux/386` | 可加 `linux/riscv64`。只用 `docker/file-name.sh` 支持的这五个 |
+
 | `tag_latest` | `true` | 额外打 `latest`。**两套镜像同时维护时，只给其中一套开** |
 | `push` | `true` | 关掉则只构建不推送，用于验证 |
 
@@ -55,7 +60,8 @@ docker pull ghcr.io/jsntit/mihomo:v1.19.34-ts
 
 ## 已发布记录
 
-| 日期 | 版本 tag | 平台 | 内核自报版本 | 运行 |
-|---|---|---|---|---|
-| 2026-11-12 | `v1.19.34-ts` + `latest` | amd64 / arm64 / arm/v7 / 386 | `Mihomo Meta v1.19.34-ts linux amd64 with go1.26.10` | [43141749531](https://github.com/jsntit/mihomo/actions/runs/43141749531) |
+| 日期 | 版本 tag | 源 | 平台 | 镜像内自报版本 | 运行 |
+|---|---|---|---|---|---|
+| 2026-11-12 | `v1.19.34-ts` + `latest` | `Alpha-ts` | amd64 / arm64 / arm/v7 / 386 | `Mihomo Meta v1.19.34-ts linux amd64 with go1.26.10` | [43141749531](https://github.com/jsntit/mihomo/actions/runs/43141749531) |
+| 2026-11-12 | `v1.19.34` | `Alpha` | amd64 / arm64 / arm/v7 / 386 | `Mihomo Meta v1.19.34 linux amd64 with go1.26.10`（`strings` 里无 `advertise-routes`，确认是纯净主线） | [43142886442](https://github.com/jsntit/mihomo/actions/runs/43142886442) |
 
