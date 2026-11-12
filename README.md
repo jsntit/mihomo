@@ -32,7 +32,8 @@
 > | TUN 内 ping 走 Tailscale 真正发 ICMP echo | `NETWORK,ICMP` 规则 |
 >
 > 除 Tailscale 相关文件外，代码与主线一致。详细说明、配置示例、同步策略见
-> **[docs/ts-features.md](docs/ts-features.md)**，各平台二进制见 [Releases](https://github.com/jsntit/mihomo/releases)。
+> **[docs/ts-features.md](docs/ts-features.md)**，各平台二进制见 [Releases](https://github.com/jsntit/mihomo/releases)，
+> Docker 镜像（多架构，GHCR）见 **[docs/docker-image.md](docs/docker-image.md)**。
 
 ## Features
 

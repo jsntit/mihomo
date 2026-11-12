@@ -1,0 +1,265 @@
+name: Docker (GHCR)
+
+# 手动触发：Actions → Docker (GHCR) → Run workflow
+#
+# 流程：
+#   1) 按平台交叉编译出 bin/mihomo-linux-<arch>-<版本>.gz（命名与仓库自带 docker/file-name.sh 的约定一致）
+#   2) 用仓库自带 Dockerfile 打多架构镜像，推送到 ghcr.io/<owner>/mihomo
+#
+# 认证：只用 GITHUB_TOKEN（permissions.packages: write），不需要额外 secret。
+#
+# 两个常用场景：
+#   ref=Alpha-ts, version=v1.19.34-ts  → 带 Tailscale 增强的镜像
+#   ref=Alpha,    version=v1.19.34     → 纯净主线镜像（tag_latest 建议其中只有一个开）
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "要打包的 ref（分支 / tag）：Alpha-ts = 带 ts 增强；Alpha = 纯主线"
+        required: true
+        default: "Alpha-ts"
+      version:
+        description: "版本号，同时写入内核 Version 与镜像 tag（留空则用 git describe 结果）"
+        required: false
+        default: ""
+      platforms:
+        description: "平台列表（逗号分隔）。Dockerfile 只认 linux/amd64、linux/arm64、linux/arm/v7、linux/386、linux/riscv64"
+        required: false
+        default: "linux/amd64,linux/arm64,linux/arm/v7,linux/386"
+      tag_latest:
+        description: "额外打一个 latest 标签"
+        type: boolean
+        default: true
+      push:
+        description: "推送到 GHCR（关闭则只构建不推送，用来验证）"
+        type: boolean
+        default: true
+
+concurrency:
+  group: docker-${{ github.ref }}-${{ github.event.inputs.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/mihomo
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  prepare:
+    name: 解析版本 / 平台
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+      version: ${{ steps.gen.outputs.version }}
+      image: ${{ steps.gen.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+
+      - name: 生成平台矩阵
+        id: gen
+        env:
+          INPUT_PLATFORMS: ${{ inputs.platforms }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+
+          # ---- 平台 -> Go 编译参数 + 产物命名（必须与 docker/file-name.sh 对齐）----
+          SEL="[]"
+          echo "$INPUT_PLATFORMS" | tr ',' '\n' | sed -E 's/^[[:space:]]+|[[:space:]]+$//g' | grep -v '^$' > /tmp/platforms.txt
+          while read -r p; do
+            case "$p" in
+              linux/amd64)   j='{"platform":"linux/amd64","goos":"linux","goarch":"amd64","goamd64":"v1","output":"amd64-v1"}' ;;
+              linux/arm64)   j='{"platform":"linux/arm64","goos":"linux","goarch":"arm64","output":"arm64"}' ;;
+              linux/arm/v7)  j='{"platform":"linux/arm/v7","goos":"linux","goarch":"arm","goarm":"7","output":"armv7"}' ;;
+              linux/386)     j='{"platform":"linux/386","goos":"linux","goarch":"386","go386":"sse2","output":"386"}' ;;
+              linux/riscv64) j='{"platform":"linux/riscv64","goos":"linux","goarch":"riscv64","output":"riscv64"}' ;;
+              *)
+                echo "::error::不支持的平台 $p（docker/file-name.sh 只认 linux/amd64、linux/arm64、linux/arm/v7、linux/386、linux/riscv64）"
+                exit 1
+                ;;
+            esac
+            SEL=$(jq -c --argjson e "$j" '. + [$e]' <<<"$SEL")
+          done < /tmp/platforms.txt
+          echo "本镜像平台：$(jq -r '.[].platform' <<<"$SEL" | paste -sd, -)"
+          echo "matrix={\"include\":$SEL}" >> "$GITHUB_OUTPUT"
+
+          # ---- 版本号 ----
+          VERSION="$INPUT_VERSION"
+          if [ -z "$VERSION" ]; then
+            VERSION=$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "版本号：$VERSION（ref=$INPUT_REF）"
+
+          # ---- 镜像地址（Docker 要求全小写）----
+          IMAGE="${REGISTRY}/$(echo "${IMAGE_NAME}" | tr '[:upper:]' '[:lower:]')"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "镜像：$IMAGE"
+
+  binaries:
+    name: 编译 ${{ matrix.platform }}
+    needs: prepare
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+
+      - name: 编译并压缩
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOAMD64: ${{ matrix.goamd64 }}
+          GOARM: ${{ matrix.goarm }}
+          GO386: ${{ matrix.go386 }}
+        run: |
+          set -euo pipefail
+          echo "== ${GOOS}/${GOARCH} (amd64=${GOAMD64:-} arm=${GOARM:-} 386=${GO386:-}) | ${VERSION}"
+          go version
+
+          export CGO_ENABLED=0
+          BUILDTIME="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          go build -tags with_gvisor -trimpath \
+            -ldflags "-extldflags --static -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid="
+
+          file mihomo
+          mkdir -p out/bin
+          gzip -9 -c mihomo > "out/bin/mihomo-linux-${{ matrix.output }}-${VERSION}.gz"
+          ls -lh out/bin
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.output }}
+          path: out/bin/*
+          if-no-files-found: error
+          retention-days: 3
+
+  image:
+    name: 打多架构镜像并推送
+    needs: [prepare, binaries]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: 收集各平台产物到 bin/
+        uses: actions/download-artifact@v4
+        with:
+          path: bin
+          merge-multiple: true
+
+      - name: 自检产物命名
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          echo "$VERSION" > bin/version.txt
+          ls -l bin
+          # 用 Dockerfile 引用的同一份脚本反推每个平台期望的文件名（脚本输出已含版本号，不带 .gz），
+          # 缺一个就直接失败，避免打出一层缺架构的镜像
+          for p in $(echo "$PLATFORMS" | tr ',' ' '); do
+            want=$(TARGETPLATFORM="$p" sh docker/file-name.sh)
+            test -f "bin/${want}.gz" || {
+              echo "::error::缺少平台 $p 的产物 bin/${want}.gz"
+              exit 1
+            }
+          done
+          echo "平台产物齐全"
+
+      - name: 安装 QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: 安装 buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: 登录 GHCR
+        if: inputs.push
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成镜像标签
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ needs.prepare.outputs.image }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=${{ needs.prepare.outputs.version }}
+            type=raw,value=latest,enable=${{ inputs.tag_latest }}
+          labels: |
+            org.opencontainers.image.title=mihomo
+            org.opencontainers.image.description=mihomo core built from ${{ inputs.ref }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: 构建并推送
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ inputs.platforms }}
+          push: ${{ inputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 写入 Job Summary
+        if: always()
+        env:
+          REF: ${{ inputs.ref }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          PLATFORMS: ${{ inputs.platforms }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          PUSHED: ${{ inputs.push }}
+        run: |
+          {
+            echo "## mihomo Docker 镜像"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 源 ref | \`${REF}\` |"
+            echo "| 版本 | \`${VERSION}\` |"
+            echo "| 平台 | \`${PLATFORMS}\` |"
+            echo "| 镜像 | \`${IMAGE}\` |"
+            echo "| digest | \`${DIGEST:-（未推送）}\` |"
+            echo ""
+            if [ "$PUSHED" = "true" ]; then
+              echo "拉取："
+              echo ""
+              echo '```bash'
+              echo "docker pull ${IMAGE}:${VERSION}"
+              echo '```'
+              echo ""
+              echo "首次推送后，包默认是私有的，去 GitHub 右上角头像 → Your packages → mihomo → Package settings 里改成 Public。"
+            else
+              echo "本次未推送（push=false），仅验证构建。"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
