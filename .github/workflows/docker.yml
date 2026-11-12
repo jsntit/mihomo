@@ -2,7 +2,9 @@ name: Docker (GHCR)
 
 # 触发方式：
 #   1) 手动：Actions → Docker (GHCR) → Run workflow
-#   2) 自动：push 一个 v*-ts 的 tag（发版即出镜像，ref/版本号自动取该 tag）
+#   2) 自动（发版）：push 一个 v*-ts 的 tag（ref/版本号自动取该 tag）
+#   3) 自动（巡检）：每周一 02:00 UTC 检查上游 MetaCubeX/mihomo 是否发了当前基线之后的
+#     新 release；有就构建 Alpha-ts 的镜像（不抢 latest）。没新版本则直接跳过，不浪费算力。
 #
 # 流程：
 #   prepare  → 解析 ref / 版本 / 平台矩阵
@@ -14,6 +16,11 @@ name: Docker (GHCR)
 # 两种常用组合：
 #   ref=Alpha-ts, version=v1.19.34-ts → 带 Tailscale 增强的镜像（当前 latest）
 #   ref=Alpha,    version=v1.19.34    → 纯净主线镜像（tag_latest 关掉，别抢 latest）
+#
+# ⚠ 巡检只负责「上游发版 → 出新镜像」，**不会**替你把 ts 补丁 rebase 到新上游。
+#   带 `-ts` 后缀的镜像意味着 ts 分支已经合过那个版本；巡检出来的是同一份代码换个版本号，
+#   若此时 ts 分支还没跟上上游，版本号会显得比实际新。所以看到巡检 PR/镜像后，
+#   仍需按 skill `mihomo-ts-upstream-sync` 把补丁重放到新上游。
 
 on:
   workflow_dispatch:
@@ -41,6 +48,9 @@ on:
   push:
     tags:
       - "v*-ts"
+  schedule:
+    # 每周一 02:00 UTC（北京 10:00）：上游发新版则自动出镜像
+    - cron: "0 2 * * 1"
 
 concurrency:
   # 带上 inputs.ref，否则同时发「主线」和「ts」两套时后一个会把前一个 cancel 掉
@@ -67,6 +77,8 @@ jobs:
       platforms: ${{ steps.gen.outputs.platforms }}
       tag_latest: ${{ steps.gen.outputs.tag_latest }}
       push: ${{ steps.gen.outputs.push }}
+      should_build: ${{ steps.gate.outputs.should_build }}
+      skip_reason: ${{ steps.gate.outputs.skip_reason }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -83,6 +95,7 @@ jobs:
           INPUT_TAG_LATEST: ${{ inputs.tag_latest }}
           INPUT_PUSH: ${{ inputs.push }}
           REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
         run: |
           set -euo pipefail
 
@@ -114,16 +127,38 @@ jobs:
           echo "本镜像平台：$(jq -r '.[].platform' <<<"$SEL" | paste -sd, -)"
           echo "matrix={\"include\":$SEL}" >> "$GITHUB_OUTPUT"
 
-          # ---- 版本号：优先用输入，其次 git describe（tag 触发时正好是 tag 名）----
+          # ---- 版本号 ----
+          # 优先级：手动输入 > tag 触发时直接取 tag 名 > 分支上的 describe > 短 sha
+          #
+          # 不能只靠 `git describe --tags --always`：tag 之后分支再提交，它会返回
+          # `v1.19.34-ts-1-g5ed6d33` 这种「tag+N-ghash」，于是镜像 tag 里出现带 `+` 的
+          # 非法字符、自动触发出来的镜像版本号也是一串看不懂的东西。
           VERSION="$INPUT_VERSION"
+          if [ -z "$VERSION" ] && [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            VERSION="$REF_NAME"
+          fi
           if [ -z "$VERSION" ]; then
-            VERSION=$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)
+            VERSION=$(git describe --tags --abbrev=0 2>/dev/null || git rev-parse --short HEAD)
+            # 分支（非 tag）上构建：版本号加分支后缀与短 sha，避免覆盖已发版的同名镜像
+            if [ "$VERSION" != "$(git rev-parse --short HEAD)" ]; then
+              SHORT=$(git rev-parse --short HEAD)
+              VERSION="${VERSION}-${REF}-${SHORT}"
+            fi
+          fi
+          if ! [[ "$VERSION" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::版本号 \"$VERSION\" 含 Docker tag 不允许的字符（只允许 [A-Za-z0-9._-]）"
+            exit 1
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "版本号：$VERSION"
 
-          # ---- 布尔开关：dispatch 用输入值；push 事件下输入为空 -> 默认 true ----
-          TAG_LATEST="${INPUT_TAG_LATEST:-true}"
+          # ---- 布尔开关：dispatch 用输入值；push 事件下输入为空 ----
+          # tag 触发的版本是显式发布的，抢 latest 合理；分支自动构建不抢，免得主线构建把
+          # ts 的 latest 顶掉（两个 workflow 各自构建，谁最后跑谁占 latest）。
+          TAG_LATEST="${INPUT_TAG_LATEST:-}"
+          if [ -z "$TAG_LATEST" ]; then
+            if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then TAG_LATEST=true; else TAG_LATEST=false; fi
+          fi
           DO_PUSH="${INPUT_PUSH:-true}"
           case "$TAG_LATEST" in true|false) ;; *) TAG_LATEST=true ;; esac
           case "$DO_PUSH" in true|false) ;; *) DO_PUSH=true ;; esac
@@ -135,9 +170,141 @@ jobs:
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
           echo "镜像：$IMAGE（latest=$TAG_LATEST, push=$DO_PUSH）"
 
+      - name: 巡检闸门（仅 schedule）
+        id: gate
+        env:
+          REF: ${{ steps.gen.outputs.ref }}
+          VERSION: ${{ steps.gen.outputs.version }}
+          IMAGE: ${{ steps.gen.outputs.image }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 后面大量 curl|jq 管道，任何一环失败（tag 不存在很正常）都不该让整个 job 挂掉，
+          # 所以这一段关掉 errexit，靠后续显式判断决定走向。
+          set +e
+
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "非定时触发，直接构建"
+            exit 0
+          fi
+
+          # 分支自动构建的版本号形如 v1.19.34-ts-Alpha-ts-b7aff549。取数字部分与 BASELINE 比，
+          # 但镜 tag 是带 v 的（v1.19.34 / v1.19.34-ts），所以另存一份带 v 的形式给 tag 用。
+          BASE_NUM=$(printf '%s\n' "${VERSION}" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+          BASE_TAG="v${BASE_NUM}"
+          echo "基线版本：${BASE_NUM:-<无法解析>}（完整版本号 $VERSION）"
+
+          # 1) 判断「这个 commit 已经发过」，依据是镜像 config 里的
+          #    `org.opencontainers.image.revision`（由 metadata-action 写入），而不是 tag —
+          #    latest 是多个版本共享的，v1.19.34 与 v1.19.34-ts 谁后跑谁占，靠 tag 反查会误判。
+          #    扫最近两个版本的 amd64 子 manifest，任一 revision 命中即视为已发。
+          #    任何一步失败都按「没发过」处理，宁可多跑一次也不要漏发。
+          HEAD_SHA=$(git rev-parse HEAD)
+          ALREADY=""
+          LAST_REV=""
+          GT=$(curl -sf "https://ghcr.io/token?service=ghcr.io&scope=repository:${IMAGE_NAME}:pull" | jq -r .token || true)
+          if [ -n "$GT" ] && [ "$GT" != "null" ]; then
+            IDX_ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json"
+            MAN_ACCEPT="application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json"
+            for t in "$VERSION" "${BASE_TAG}-ts" "$BASE_TAG"; do
+              [ -n "$t" ] || continue
+              SUB=$(curl -sf -H "Authorization: Bearer $GT" -H "Accept: $IDX_ACCEPT" \
+                      "https://ghcr.io/v2/${IMAGE_NAME}/manifests/${t}" 2>/dev/null \
+                    | jq -r '[.manifests[] | select(.platform.architecture=="amd64")][0].digest // empty' || true)
+              [ -n "$SUB" ] || continue
+              CFG=$(curl -sf -H "Authorization: Bearer $GT" -H "Accept: $MAN_ACCEPT" \
+                      "https://ghcr.io/v2/${IMAGE_NAME}/manifests/${SUB}" 2>/dev/null \
+                    | jq -r '.config.digest // empty' || true)
+              [ -n "$CFG" ] || continue
+              REV=$(curl -sfL -H "Authorization: Bearer $GT" \
+                      "https://ghcr.io/v2/${IMAGE_NAME}/blobs/${CFG}" 2>/dev/null \
+                    | jq -r '.config.Labels["org.opencontainers.image.revision"] // empty' || true)
+              echo "tag $t -> revision ${REV:-<无>}"
+              # LAST_REV 只认第一个拿到的（顺序是 ts 优先），别被后面的主线 tag 覆盖，
+              # 否则「上次出镜像的 commit」会变成主线那次，提交数就算错了。
+              if [ -n "$REV" ] && [ -z "$LAST_REV" ]; then LAST_REV="$REV"; fi
+              if [ "$REV" = "$HEAD_SHA" ]; then ALREADY="$t"; break; fi
+            done
+          fi
+          if [ -n "$ALREADY" ]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "skip_reason=当前 commit ${HEAD_SHA:0:8} 已经出过镜像（$ALREADY），跳过" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # 2) 上游有没有比 BASELINE 更新的 release（BASELINE 跟随 ts 分支当前基线）。
+          #    注意：上游没新版本 ≠ 不用构建 —— ts 分支自己的提交（修 bug、加功能）也需要出新镜像。
+          #    所以这里只在「本分支也没有新提交」时才拦；有没有新提交由第 3 步查。
+          #    版本比较用 sort -V（字典序会把 1.9.0 判成比 1.19.34 新），只取 x.y.z 数字段。
+          BASELINE=$(tr -d 'v' < BASELINE 2>/dev/null || echo "")
+          NEW_UPSTREAM="false"
+          if [ -z "$BASELINE" ]; then
+            echo "没有 BASELINE 文件，跳过上游比较（只看本分支提交）"
+          else
+            UPSTREAM=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
+                       https://api.github.com/repos/MetaCubeX/mihomo/releases/latest \
+                       | jq -r '.tag_name // empty' 2>/dev/null | tr -d 'v' || true)
+            newver() { printf '%s\n' "$1" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1; }
+            B=$(newver "$BASELINE"); U=$(newver "$UPSTREAM")
+            echo "上游最新：${U:-<未知>} / 本分支基线：${B:-<未知>}"
+            if [ -n "$B" ] && [ -n "$U" ] && [ "$U" != "$B" ] \
+               && [ "$(printf '%s\n%s\n' "$B" "$U" | sort -V | tail -1)" = "$U" ]; then
+              NEW_UPSTREAM="true"
+              echo "→ 上游 $U 比基线 $B 新，本次需要重建（同时提示：该把 ts 补丁跟到 $U 了）"
+            fi
+          fi
+
+          # 3) 本分支相对「上次出镜像的 commit」有没有新提交
+          #    上一次出镜像的 commit 从镜像 label 里拿；拿不到就退化成「上游是否变新」。
+          NEW_COMMITS="false"
+          if [ -n "$LAST_REV" ] && [ "$LAST_REV" != "$HEAD_SHA" ]; then
+            if ! git merge-base --is-ancestor "$LAST_REV" "$HEAD_SHA" 2>/dev/null; then
+              echo "上次出镜像的 commit ${LAST_REV:0:8} 不是本次的祖先（可能已 force push），按有新提交处理"
+              NEW_COMMITS="true"
+            else
+              COUNT=$(git rev-list --count "${LAST_REV}..${HEAD_SHA}" 2>/dev/null || echo 0)
+              echo "上次出镜像：${LAST_REV:0:8} → 本次 ${HEAD_SHA:0:8}，新提交 $COUNT 个"
+              [ "$COUNT" -gt 0 ] && NEW_COMMITS="true"
+            fi
+          elif [ -z "$LAST_REV" ]; then
+            echo "查不到上次出镜像的 commit（包为空或读取失败）"
+            NEW_COMMITS="true"
+          fi
+
+          if [ "$NEW_UPSTREAM" = "true" ] || [ "$NEW_COMMITS" = "true" ]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "构建原因：上游新版本=$NEW_UPSTREAM / 本分支新提交=$NEW_COMMITS"
+            exit 0
+          fi
+          echo "should_build=false" >> "$GITHUB_OUTPUT"
+          echo "skip_reason=上游仍是 ${BASE_NUM}，本分支自 ${LAST_REV:0:8} 后也无新提交，跳过" >> "$GITHUB_OUTPUT"
+
+      - name: 播报巡检结论
+        if: always() && github.event_name == 'schedule'
+        env:
+          SHOULD: ${{ steps.gate.outputs.should_build }}
+          REASON: ${{ steps.gate.outputs.skip_reason }}
+          VERSION: ${{ steps.gen.outputs.version }}
+        run: |
+          {
+            echo "## 定时巡检（上游发版检查）"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 结论 | $([ "$SHOULD" = "true" ] && echo "有新版本，构建镜像" || echo "跳过：${REASON:-已是最新}") |"
+            echo "| 本次版本号 | \`${VERSION}\` |"
+            echo ""
+            if [ "$SHOULD" != "true" ]; then
+              echo "> 跳过后下次巡检仍会检查；想立刻构建请手动 Run workflow 并显式填 version。"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
   binaries:
     name: 编译 ${{ matrix.platform }}
     needs: prepare
+    # 定时巡检判定「无需构建」时整段跳过，不占 runner
+    if: needs.prepare.outputs.should_build == 'true'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -187,6 +354,7 @@ jobs:
   image:
     name: 打多架构镜像并推送
     needs: [prepare, binaries]
+    if: needs.prepare.outputs.should_build == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4

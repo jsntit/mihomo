@@ -5,19 +5,42 @@
 
 ## 用法
 
-两种触发方式：
+三种触发方式：
 
 1. **手动**：Actions → **Docker (GHCR)** → Run workflow，按下表填参数。
-2. **自动**：push 一个 `v*-ts` 的 tag，就会跟着 `Build (ts)` 一起出镜像 ——
-   此时 `ref` 取该 tag、`version` 取 tag 名（`git describe` 的结果正好是 tag）、`tag_latest=true`。
+2. **发版自动**：push 一个 `v*-ts` 的 tag，就会跟着 `Build (ts)` 一起出镜像 ——
+   此时 `ref` 取该 tag、`version` 直接取 tag 名（不走 `git describe`，见下面坑）、`tag_latest=true`。
+3. **定时巡检**：每周一 02:00 UTC（北京 10:00）自动检查，满足**任一**条件就出镜像：
+   - 上游 `MetaCubeX/mihomo` 发了比 `BASELINE` 新的 release；
+   - 本分支相对「上次出镜像的那个 commit」有新提交。
+
+   两个条件都不满足就整段跳过，只留一条 Job Summary，不跑编译。分支自动构建**不抢 `latest`**。
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `ref` | `Alpha-ts` | 打包哪个分支/tag。`Alpha-ts` = 带 Tailscale 增强；`Alpha` = 纯净主线 |
-| `version` | 空 | 写进内核 `Version` 与镜像 tag；留空则用 `git describe` |
+| `version` | 空 | 写进内核 `Version` 与镜像 tag；留空则按「tag 名 → 分支 describe → 短 sha」推断 |
 | `platforms` | `linux/amd64,linux/arm64,linux/arm/v7,linux/386` | 可加 `linux/riscv64`。只用 `docker/file-name.sh` 支持的这五个 |
 | `tag_latest` | `true` | 额外打 `latest`。**两套镜像同时维护时，只给其中一套开** |
 | `push` | `true` | 关掉则只构建不推送，用于验证 |
+
+### `BASELINE` 文件
+
+仓库根目录的 `BASELINE` 记录「ts 分支当前跟上到哪个上游版本」，巡检拿它跟上游最新 release 比。
+**把 ts 补丁重放到新上游之后，记得同步改这个文件**（`v1.19.34` 这种格式），否则巡检会反复判定
+「上游有新版本」，每周都白构建一次。
+
+> 巡检只负责「上游发版 → 出新镜像」，**不会**替你把补丁 rebase 到新上游。带 `-ts` 后缀的镜像
+> 意味着该分支已合过那个版本；若分支还没跟上而巡检先跑了，镜像版本号会显得比实际新。
+> 正确顺序是：按 skill `mihomo-ts-upstream-sync` 重放补丁 → 改 `BASELINE` → 推送。
+
+### 巡检的节流依据
+
+判断「这个 commit 有没有发过镜像」不看 tag（`latest` 由多个版本共享，`v1.19.34` 与
+`v1.19.34-ts` 谁后跑谁占，靠 tag 反查会误判），而是读镜像 config 里的
+`org.opencontainers.image.revision`（`metadata-action` 写入的构建时 commit），
+再用 `git rev-list --count` 数本分支自那以后的新提交数。任何一步读不到都按「没发过」处理——
+宁可多跑一次也不漏发。
 
 拉取：
 
@@ -73,6 +96,13 @@ docker run -d --name mihomo --network host --cap-add NET_ADMIN \
   `platform=unknown/unknown` 的额外 4 个条目，且都没有 tag，GHCR 版本列表里又是一串看不懂的
   `sha256:`。工作流里已设 `provenance: false` + `sbom: false`，要恢复构建溯源把这两行删掉即可。
 - **`latest` 只有一个**：谁最后跑谁占。同时维护 ts 与主线两套镜像时，最好只给一套开 `tag_latest`。
+  现在 tag 触发与手动都默认抢 `latest`，**定时巡检不抢**（分支自动构建给 `latest` 没意义）。
+- **别用 `git describe --tags --always` 当版本号**：tag 之后分支再有提交，它返回
+  `v1.19.34-ts-1-g5ed6d33` 这种「tag+N-ghash」形式 —— 这个字符串是**中间产物**，不是版本号。
+  现在的取值顺序是：手动输入 → tag 触发时直接用 `github.ref_name` → 分支上取最近的 tag
+  再拼 `-<ref>-<短sha>`（形如 `v1.19.34-ts-Alpha-ts-b7aff549`），并校验只含 `[A-Za-z0-9._-]`。
+- **分支构建的版本号带 ref 与短 sha**：不同分支 / 不同提交各自出各自的镜像 tag，
+  不会互相覆盖；代价是 tag 多，想清理就按「只保留带 `-ts` 的正式版」删。
 - 镜像内含 `geoip.metadb` / `geosite.dat` / `geoip.dat`，是**构建时**从
   [meta-rules-dat](https://github.com/MetaCubeX/meta-rules-dat) 拉的最新版，配置目录是 `/root/.config/mihomo/`。
   用 `-v` 挂自己的目录会盖掉这三个文件，需要自己放一份。
