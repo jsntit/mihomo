@@ -39,11 +39,23 @@ docker pull ghcr.io/jsntit/mihomo:v1.19.34-ts
 
 ## 注意事项
 
-- **首次推送后包是私有的**：GitHub → 头像 → Your packages → `mihomo` → Package settings → Change visibility → Public。
+- **包可见性**：本仓库这套流程首次推送后，实测包是 `public`；若显示私有，去
+  GitHub → 头像 → Your packages → `mihomo` → Package settings → Change visibility 改成 Public。
   私有包拉取需要 `docker login ghcr.io -u <user> -p <PAT with read:packages>`。
+- **index 里会多出 4 个 `unknown/unknown` 条目**：那是 buildx 默认生成的 provenance 证明（每个平台一个），
+  不是多出来的架构，`docker pull` 会按本机平台自己挑。要彻底干净可以在
+  `docker/build-push-action` 里加 `provenance: false`（代价是失去构建溯源）。
+- **`latest` 只有一个**：谁最后跑谁占。同时维护 ts 与主线两套镜像时，最好只给一套开 `tag_latest`。
 - 镜像内含 `geoip.metadb` / `geosite.dat` / `geoip.dat`，是**构建时**从
   [meta-rules-dat](https://github.com/MetaCubeX/meta-rules-dat) 拉的最新版，配置目录是 `/root/.config/mihomo/`。
   用 `-v` 挂自己的目录会盖掉这三个文件，需要自己放一份。
 - 镜像只提供 `linux/amd64`、`linux/arm64`、`linux/arm/v7`、`linux/386`、`linux/riscv64`；
   其它平台（armv5/armv6/mips/loong64 等）请用 Releases 里的静态二进制。
 - Docker 构建需要 QEMU 模拟跑 `apk add`，4 平台大约 1~2 分钟；编译阶段每个平台约 1~2 分钟。
+
+## 已发布记录
+
+| 日期 | 版本 tag | 平台 | 内核自报版本 | 运行 |
+|---|---|---|---|---|
+| 2026-11-12 | `v1.19.34-ts` + `latest` | amd64 / arm64 / arm/v7 / 386 | `Mihomo Meta v1.19.34-ts linux amd64 with go1.26.10` | [43141749531](https://github.com/jsntit/mihomo/actions/runs/43141749531) |
+
